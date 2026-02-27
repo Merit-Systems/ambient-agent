@@ -2,7 +2,7 @@ import type {
   GroupParticipantInfo,
   SystemState,
   UserResearchContext,
-} from "@/src/ai/agents/systemPrompt";
+} from "@/src/types/conversation";
 import prisma from "@/src/db/client";
 import { getUserConnections } from "@/src/db/connection";
 import { getGroupChatCustomPrompt } from "@/src/db/groupChatSettings";
