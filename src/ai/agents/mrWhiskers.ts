@@ -1,32 +1,8 @@
-import { createImageTool } from "@/src/ai/tools";
-import { grokSearchTool } from "@/src/ai/tools/search";
-import { IMessageResponseSchema } from "@/src/lib/loopmessage-sdk/message-actions";
-import { createAnthropic } from "@ai-sdk/anthropic";
-import { createAgent } from "./factory";
 import { mrWhiskersPersonality } from "./personalities";
+import type { Agent } from "./types";
 
-const anthropic = createAnthropic({
-  // apiKey: process.env.ECHO_API_KEY,
-  // baseURL: "https://echo.router.merit.systems",
-});
-
-/**
- * Base Mr. Whiskers agent configuration.
- *
- * NOTE: This agent includes static tools (createImage, webSearch).
- * Context-bound tools (getUserContext, updateUserContext, scheduledJobs, etc.)
- * are added dynamically in respondToMessage based on the conversation context.
- *
- * createImage is static because Claude can now SEE images in the conversation
- * (they're prepended as visual context), so it knows which URL to pass.
- */
-export const mrWhiskersAgent = createAgent({
+export const mrWhiskersAgent: Agent = {
+  id: mrWhiskersPersonality.id,
+  name: mrWhiskersPersonality.name,
   personality: mrWhiskersPersonality,
-  model: anthropic("claude-sonnet-4-5"),
-  schema: IMessageResponseSchema,
-  tools: {
-    // Static tools
-    createImage: createImageTool,
-    search: grokSearchTool,
-  },
-});
+};

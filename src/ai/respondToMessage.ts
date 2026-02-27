@@ -1,386 +1,250 @@
 import type { Agent } from "@/src/ai/agents/types";
-import { getAppForContext } from "@/src/ai/apps";
-import {
-  createCalendarTools,
-  createClaudeTaskTool,
-  createCompleteOnboardingTool,
-  createGenerateConnectionLinkTool,
-  createGetUserContextTool,
-  createGitHubTools,
-  createGmailTools,
-  createGroupChatSettingsTools,
-  createNegotiationTools,
-  createRequestFeatureTool,
-  createRequestResearchTool,
-  createScheduledJobTools,
-  createSwitchAppTool,
-  createUpdateUserContextTool,
-  createWorkspaceTools,
-} from "@/src/ai/tools";
-import { hasActiveConnections } from "@/src/ai/tools/helpers";
 import type { ConversationContext } from "@/src/db/conversation";
-import { logToolCall } from "@/src/db/events";
 import logger from "@/src/lib/logger";
-import type {
-  IMessageResponse,
-  MessageAction,
-} from "@/src/lib/loopmessage-sdk/message-actions";
-import { Output, ToolLoopAgent, type ModelMessage } from "ai";
+import type { MessageAction } from "@/src/lib/loopmessage-sdk/message-actions";
+import type { ModelMessage } from "ai";
 
-// Re-export MessageAction type for convenience
 export type { MessageAction } from "@/src/lib/loopmessage-sdk/message-actions";
 
-/**
- * Options for respondToMessage
- */
 export interface RespondToMessageOptions {
-  /**
-   * Optional callback fired once when the first tool call is about to execute.
-   * Use this to send a "working on it" notification to the user.
-   */
   onToolsInvoked?: (toolNames: string[]) => Promise<void>;
-  /**
-   * AbortController for cancelling generation when superseded by a newer task.
-   */
   abortController?: AbortController;
-  /**
-   * Polling callback to check if this generation should abort.
-   * Called every 300ms during generation.
-   */
   checkShouldAbort?: () => Promise<boolean>;
 }
 
-/**
- * Generate a response using the provided agent and conversation context.
- *
- * AI SDK v6 Pattern: Use ToolLoopAgent which handles both tool calling
- * and structured output generation automatically.
- *
- * @param agent - The agent to use for generating the response
- * @param messages - The conversation message history (ModelMessage[] from getConversationMessages)
- * @param context - The conversation context (group vs DM, summary, etc.)
- * @param options - Optional callbacks and configuration
- * @returns Array of MessageActions (messages or reactions) to execute
- */
+function buildClaudePrompt(
+  agent: Agent,
+  messages: ModelMessage[],
+  context: ConversationContext,
+): string {
+  const parts: string[] = [];
+
+  parts.push("You are responding to an iMessage conversation.");
+  parts.push("");
+  parts.push("=== PERSONALITY ===");
+  parts.push(agent.personality.prompt);
+  parts.push("");
+  parts.push("=== CONVERSATION INFO ===");
+  parts.push(`Conversation ID: ${context.conversationId}`);
+  parts.push(`Type: ${context.isGroup ? "GROUP CHAT" : "DIRECT MESSAGE"}`);
+
+  if (context.isGroup && context.sender) {
+    parts.push(`Current sender: ${context.sender}`);
+  }
+
+  if (context.summary) {
+    parts.push(`Summary: ${context.summary}`);
+  }
+
+  if (context.systemState?.currentTime) {
+    const { formatted, timezone } = context.systemState.currentTime;
+    parts.push(`Current time: ${formatted} (${timezone})`);
+  }
+
+  if (context.groupParticipants && context.groupParticipants.length > 0) {
+    parts.push("");
+    parts.push("Group participants:");
+    for (const p of context.groupParticipants) {
+      const name = p.name || "Unknown";
+      const brief = p.brief ? ` - ${p.brief}` : "";
+      parts.push(`  ${p.phoneNumber}: ${name}${brief}`);
+    }
+  }
+
+  if (context.userContext) {
+    parts.push("");
+    parts.push("User context:");
+    if (context.userContext.summary) parts.push(`  ${context.userContext.summary}`);
+    if (context.userContext.interests?.length) {
+      parts.push(`  Interests: ${context.userContext.interests.join(", ")}`);
+    }
+  }
+
+  if (context.systemState) {
+    const connected: string[] = [];
+    if (context.systemState.connections.gmail) connected.push("Gmail");
+    if (context.systemState.connections.github) connected.push("GitHub");
+    if (context.systemState.connections.calendar) connected.push("Calendar");
+    if (connected.length > 0) {
+      parts.push(`Connected accounts: ${connected.join(", ")}`);
+    }
+  }
+
+  parts.push("");
+  parts.push("=== OUTPUT FORMAT ===");
+  parts.push("You MUST output ONLY a valid JSON array of MessageAction objects. No markdown, no explanation, just the JSON array.");
+  parts.push("Each action: { type: \"message\"|\"reaction\", text?, attachments?, effect?, delay?, message_id?, reaction? }");
+  parts.push("Effects: slam, loud, gentle, invisible-ink, confetti, fireworks, lasers, love, balloons, spotlight, echo");
+  parts.push("Reactions: love, like, dislike, laugh, exclaim, question (prefix with - to remove)");
+  parts.push("Return [] if no response needed (especially in group chats).");
+  parts.push("");
+  parts.push("=== IMESSAGE RULES ===");
+  parts.push("Message IDs: User messages include [msg_id: ABC123]. Extract message_id from brackets for reactions.");
+  parts.push("");
+  if (context.isGroup) {
+    parts.push("GROUP CHAT: Respond in 1 message max (2 if absolutely necessary). Often a reaction is better. You do NOT need to respond to everything.");
+  } else {
+    parts.push("DM: Use multiple messages for fragmented thoughts (max 3-4). Add delays (500-8000ms) between messages.");
+  }
+  parts.push("");
+  parts.push("Reactions: Incoming reactions appear as [REACTION: {type} on msg_id: {id}]. Usually return [] for incoming reactions.");
+  parts.push("System messages: [SYSTEM: Deliver this message from X] MUST be delivered - you are a delivery service.");
+  parts.push("");
+
+  if (context.recentAttachments && context.recentAttachments.length > 0) {
+    parts.push("=== RECENT IMAGES ===");
+    context.recentAttachments.slice(0, 3).forEach((url, i) => {
+      parts.push(`Image ${i}: ${url}`);
+    });
+    parts.push("");
+  }
+
+  parts.push("=== CONVERSATION HISTORY ===");
+  for (const msg of messages) {
+    const role = msg.role === "user" ? "USER" : "ASSISTANT";
+    const content = typeof msg.content === "string"
+      ? msg.content
+      : JSON.stringify(msg.content);
+    parts.push(`[${role}] ${content}`);
+  }
+
+  return parts.join("\n");
+}
+
+async function consumeClaudeStream(response: Response): Promise<string> {
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Claudflare error ${response.status}: ${errorText}`);
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("No response body from claudflare");
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let lastResultText = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line);
+        if (event.type === "result" && event.result) {
+          lastResultText = event.result;
+        } else if (event.type === "content" && event.content) {
+          lastResultText = event.content;
+        }
+      } catch {
+        // not JSON, skip
+      }
+    }
+  }
+
+  if (buffer.trim()) {
+    try {
+      const event = JSON.parse(buffer);
+      if (event.type === "result" && event.result) {
+        lastResultText = event.result;
+      } else if (event.type === "content" && event.content) {
+        lastResultText = event.content;
+      }
+    } catch {
+      if (!lastResultText) lastResultText = buffer;
+    }
+  }
+
+  return lastResultText;
+}
+
+function parseActions(text: string): MessageAction[] {
+  const trimmed = text.trim();
+
+  const jsonMatch = trimmed.match(/\[[\s\S]*\]/);
+  if (!jsonMatch) {
+    logger.warn("Could not find JSON array in claudflare response", { text: trimmed.slice(0, 500) });
+    return [];
+  }
+
+  try {
+    const parsed = JSON.parse(jsonMatch[0]);
+    if (!Array.isArray(parsed)) return [];
+    return parsed as MessageAction[];
+  } catch (err) {
+    logger.error("Failed to parse actions from claudflare response", { error: err, text: trimmed.slice(0, 500) });
+    return [];
+  }
+}
+
+async function getWorkspaceForConversation(context: ConversationContext): Promise<string> {
+  if (context.userContext?.professional) {
+    const prof = context.userContext.professional as Record<string, Record<string, string>>;
+    if (prof.github?.username) return prof.github.username;
+  }
+  return "default";
+}
+
 export async function respondToMessage(
-  defaultAgent: Agent,
+  agent: Agent,
   messages: ModelMessage[],
   context: ConversationContext,
   options?: RespondToMessageOptions,
 ): Promise<MessageAction[]> {
   const before = performance.now();
-
-  // Get active app (foreground app for this conversation)
-  const activeApp = getAppForContext(context);
-
-  // Use app's agent if defined, otherwise use the default agent
-  const agent = activeApp?.agent ?? defaultAgent;
-
-  // Build conversation context string using agent's context builder
-  const contextString = agent.buildContext(context);
-
-  // Check if user has any connections before creating integration tools
-  // This reduces memory usage when no OAuth connections exist
-  const userHasConnections = await hasActiveConnections(context);
-
-  // Create context-bound tools (identity from system context, cannot be spoofed)
-  // These tools get user identity from context.sender (for groups) or context.conversationId (for DMs)
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const contextBoundTools: Record<string, any> = {
-    getUserContext: createGetUserContextTool(context),
-    updateUserContext: createUpdateUserContextTool(context),
-    requestResearch: createRequestResearchTool(context),
-    requestFeature: createRequestFeatureTool(context),
-    completeOnboarding: createCompleteOnboardingTool(context),
-    switchApp: createSwitchAppTool(context),
-    ...createScheduledJobTools(context),
-    // Negotiation tools (available when negotiation app is active)
-    ...createNegotiationTools(context),
-    // Workspace tools (claim/manage Claude workspace)
-    ...createWorkspaceTools(context),
-    // Claude task execution tool
-    claude_task: createClaudeTaskTool(context),
-  };
-
-  // Add DM-only tools (connection link not available in groups to prevent spam)
-  if (!context.isGroup) {
-    contextBoundTools.generateConnectionLink =
-      createGenerateConnectionLinkTool(context);
-  }
-
-  // Add group chat-only tools (settings management)
-  if (context.isGroup) {
-    const groupTools = createGroupChatSettingsTools(context);
-    Object.assign(contextBoundTools, groupTools);
-  }
-
-  // Conditionally merge integration tools only if user has connections
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const integrationTools: Record<string, any> = userHasConnections
-    ? {
-        ...createGmailTools(context),
-        ...createGitHubTools(context),
-        ...createCalendarTools(context),
-      }
-    : {};
-
-  // Combine all available tools
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let allTools: Record<string, any> = {
-    ...(agent.tools || {}),
-    ...contextBoundTools,
-    ...integrationTools,
-  };
-
-  // If an app is active, filter tools to only those allowed
-  if (activeApp?.allowedTools) {
-    const allowedSet = new Set(activeApp.allowedTools);
-    allTools = Object.fromEntries(
-      Object.entries(allTools).filter(([name]) => allowedSet.has(name)),
-    );
-  }
-
-  // Add app-specific additional tools
-  if (activeApp?.additionalTools) {
-    allTools = { ...allTools, ...activeApp.additionalTools };
-  }
-
-  const totalToolCount = Object.keys(allTools).length;
   const log = logger.child({
-    component: agent.name,
+    component: "respondToMessage",
     conversationId: context.conversationId,
     isGroup: context.isGroup,
     sender: context.sender,
-    app: activeApp?.id || "default",
   });
 
-  log.info("Generating response", {
-    type: context.isGroup ? "GROUP_CHAT" : "DIRECT_MESSAGE",
-    toolCount: totalToolCount,
-    app: activeApp?.id || "default",
-  });
+  const claudflareUrl = process.env.CLAUDFLARE_URL;
+  const claudflareSecret = process.env.CLAUDFLARE_API_KEY;
 
-  if (context.isGroup && !context.sender) {
-    log.error("Group chat but context.sender is not set - tool auth will fail");
+  if (!claudflareUrl || !claudflareSecret) {
+    throw new Error("CLAUDFLARE_URL and CLAUDFLARE_API_KEY must be set");
   }
-  if (context.sender) {
-    log.debug("Tools authenticated", { authenticatedAs: context.sender });
-  }
-  if (userHasConnections) {
-    log.debug("User has active OAuth connections - integration tools enabled");
-  }
-  if (activeApp) {
-    log.debug("App active", {
-      appId: activeApp.id,
-      appName: activeApp.name,
-      allowedTools: activeApp.allowedTools,
+
+  const prompt = buildClaudePrompt(agent, messages, context);
+  const workspaceUsername = await getWorkspaceForConversation(context);
+  const requestId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  log.info("Sending to claudflare", { requestId, workspaceUsername });
+
+  if (options?.onToolsInvoked) {
+    options.onToolsInvoked(["claudflare"]).catch((err) => {
+      log.error("Error in onToolsInvoked callback", { error: err });
     });
   }
 
-  log.debug("Tool list", { tools: Object.keys(allTools) });
-
-  // Validate each tool schema in detail
-  Object.entries(allTools).forEach(([name, tool]) => {
-    const toolObj = tool as { inputSchema?: unknown };
-    if (!toolObj.inputSchema) {
-      log.error("Tool missing inputSchema", { toolName: name });
-    }
-  });
-
-  // Build app context injection if an app is active
-  let appContextInjection = "";
-  if (activeApp) {
-    const separator = "═".repeat(50);
-    appContextInjection = `\n\n${separator}\nAPP: ${activeApp.name}\n\n${activeApp.systemPrompt}\n${separator}`;
-
-    // Add custom app context if defined
-    if (activeApp.buildAppContext) {
-      appContextInjection += `\n\n${activeApp.buildAppContext(context)}`;
-    }
-  }
-
-  // Combine context with agent's base instructions and app prompt
-  const systemPrompt = `${contextString}${appContextInjection}\n\n${agent.baseInstructions}`;
-
-  // Track if we've already notified about tool use (only fire once)
-  let hasNotifiedToolUse = false;
-
-  // Create ToolLoopAgent with structured output support
-  const loopAgent = new ToolLoopAgent({
-    model: agent.model,
-    ...(Object.keys(allTools).length > 0 ? { tools: allTools } : {}),
-    instructions: systemPrompt,
-    output: Output.object({
-      schema: agent.schema,
-    }),
-    // Fire callback on first tool call to notify user we're working
-    onStepFinish: async ({ toolCalls }) => {
-      if (
-        toolCalls &&
-        toolCalls.length > 0 &&
-        !hasNotifiedToolUse &&
-        options?.onToolsInvoked
-      ) {
-        hasNotifiedToolUse = true;
-        const toolNames = toolCalls.map((tc) => tc.toolName);
-        log.info("Tool call detected, firing onToolsInvoked", {
-          tools: toolNames,
-        });
-        try {
-          await options.onToolsInvoked(toolNames);
-        } catch (err) {
-          log.error("Error in onToolsInvoked callback", { error: err });
-        }
-      }
+  const response = await fetch(`${claudflareUrl}/execute`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${claudflareSecret}`,
+      "X-Request-ID": requestId,
     },
+    body: JSON.stringify({
+      task: prompt,
+      repo: `MeritSpace/${workspaceUsername}`,
+    }),
+    signal: options?.abortController?.signal,
   });
 
-  // Prepend recent images so Claude can visually "see" them
-  // This allows Claude to understand image content when user says "make it brighter" etc.
-  let messagesWithImageContext = messages;
+  const finalText = await consumeClaudeStream(response);
+  const actions = parseActions(finalText);
 
-  log.debug("Recent attachments", {
-    count: context.recentAttachments?.length ?? 0,
+  const after = performance.now();
+  log.info("Claudflare response", {
+    timeMs: Math.round(after - before),
+    actionCount: actions.length,
   });
 
-  if (context.recentAttachments && context.recentAttachments.length > 0) {
-    // Include up to 3 most recent images for context (to limit token usage)
-    const imagesToShow = context.recentAttachments.slice(0, 3);
-    // Build content with labeled images and their URLs
-    const imageContent: Array<
-      { type: "text"; text: string } | { type: "image"; image: URL }
-    > = [
-      {
-        type: "text",
-        text: `[CONTEXT: Recent images in this conversation. When user asks to edit/modify an image, use createImage with the image's URL:]`,
-      },
-    ];
-
-    imagesToShow.forEach((url, i) => {
-      imageContent.push({ type: "text", text: `[Image ${i} URL: ${url}]` });
-      imageContent.push({ type: "image", image: new URL(url) });
-    });
-
-    const imageContextMessage: ModelMessage = {
-      role: "user",
-      content: imageContent,
-    };
-
-    // Insert image context at the beginning, followed by an assistant acknowledgment
-    messagesWithImageContext = [
-      imageContextMessage,
-      {
-        role: "assistant",
-        content:
-          "[Acknowledged - I can see these images. If asked to edit one, I'll use createImage with the image's URL.]",
-      } as ModelMessage,
-      ...messages,
-    ];
-
-    log.debug("Added images to context for visual awareness", {
-      imageCount: imagesToShow.length,
-    });
-  }
-
-  log.debug("Calling ToolLoopAgent.generate()", {
-    messageCount: messagesWithImageContext.length,
-  });
-
-  // Start polling interval if checkShouldAbort is provided
-  let pollInterval: ReturnType<typeof setInterval> | null = null;
-  if (options?.checkShouldAbort && options?.abortController) {
-    pollInterval = setInterval(async () => {
-      try {
-        const shouldAbort = await options.checkShouldAbort!();
-        if (shouldAbort) {
-          log.info("Generation superseded, aborting");
-          options.abortController!.abort();
-          if (pollInterval) clearInterval(pollInterval);
-        }
-      } catch (err) {
-        log.error("Error in checkShouldAbort", { error: err });
-      }
-    }, 300);
-  }
-
-  try {
-    const result = await loopAgent.generate({
-      messages: messagesWithImageContext,
-      abortSignal: options?.abortController?.signal,
-    });
-
-    const after = performance.now();
-    log.info("Response generated", { timeMs: Math.round(after - before) });
-
-    if (result.steps && result.steps.length > 0) {
-      for (const step of result.steps) {
-        // Log tool calls with their results
-        if (step.toolCalls && step.toolResults) {
-          for (let i = 0; i < step.toolCalls.length; i++) {
-            const toolCall = step.toolCalls[i];
-            const toolResult = step.toolResults[i];
-
-            const output = toolResult?.output as
-              | { success?: boolean; message?: string }
-              | undefined;
-
-            const success = !(
-              output &&
-              typeof output === "object" &&
-              output.success === false
-            );
-
-            if (!success) {
-              log.error("Tool failed", {
-                tool: toolCall.toolName,
-                error: output?.message || "Unknown error",
-              });
-            } else {
-              log.debug("Tool result", {
-                tool: toolCall.toolName,
-              });
-            }
-
-            // Log tool call event
-            await logToolCall(context.conversationId, {
-              toolName: toolCall.toolName,
-              input: toolCall.input,
-              output: toolResult?.output,
-              success,
-              error: !success ? output?.message : undefined,
-            });
-          }
-        }
-      }
-    }
-
-    const output = result.output as IMessageResponse;
-    const actions = output.actions;
-
-    if (actions.length === 0) {
-      log.info("AI returned 0 actions", {
-        isGroup: context.isGroup,
-        sender: context.sender,
-        stepCount: result.steps?.length ?? 0,
-        reason: output.noResponseReason ?? "none provided",
-      });
-    } else {
-      log.info("Generated actions", { actionCount: actions.length });
-    }
-
-    return actions;
-  } catch (error) {
-    const after = performance.now();
-    if (options?.abortController?.signal.aborted) {
-      log.info("Generation aborted", { timeMs: Math.round(after - before) });
-      return [];
-    }
-    log.error("Error generating response", {
-      timeMs: Math.round(after - before),
-      error,
-    });
-    throw error;
-  } finally {
-    if (pollInterval) clearInterval(pollInterval);
-  }
+  return actions;
 }

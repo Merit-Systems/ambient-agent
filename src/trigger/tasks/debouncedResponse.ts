@@ -20,80 +20,16 @@ const loopClient = new LoopMessageClient({
   senderName: process.env.LOOP_SENDER_NAME!,
 });
 
-/**
- * Tool-specific loading messages
- * Each tool maps to an array of possible messages to randomly choose from
- */
-const TOOL_LOADING_MESSAGES: Record<string, string[]> = {
-  // Search tools
-  "websearch-perplexity": [
-    "let me look that up...",
-    "searching...",
-    "checking on that...",
-  ],
+const LOADING_MESSAGES = [
+  "one sec...",
+  "thinking...",
+  "on it...",
+  "lemme check...",
+  "working on it...",
+];
 
-  // Image generation
-  createImage: ["one sec...", "creating that...", "working on it..."],
-
-  // Calendar tools
-  getCalendarEvents: [
-    "checking your calendar...",
-    "looking at your schedule...",
-  ],
-  createCalendarEvent: [
-    "adding that to your calendar...",
-    "scheduling that...",
-  ],
-
-  // Gmail tools
-  getEmails: ["checking your inbox...", "looking through your emails..."],
-  sendEmail: ["sending that...", "drafting your email..."],
-
-  // GitHub tools
-  getGitHubNotifications: [
-    "checking github...",
-    "looking at your notifications...",
-  ],
-  getGitHubPullRequests: [
-    "checking your PRs...",
-    "looking at pull requests...",
-  ],
-
-  // Research tools
-  requestResearch: ["digging into that...", "researching..."],
-
-  // Context tools
-  getUserContext: ["let me recall...", "thinking..."],
-  updateUserContext: ["noted...", "got it..."],
-
-  // Connection tools
-  generateConnectionLink: ["getting that link...", "one moment..."],
-
-  // Scheduled jobs
-  createScheduledJob: ["scheduling that...", "setting that up..."],
-  listScheduledJobs: [
-    "checking your reminders...",
-    "looking at scheduled items...",
-  ],
-
-  // Claude task execution
-  claude_task: ["starting that up...", "spinning up claude...", "on it..."],
-};
-
-/**
- * Get a random loading message for the given tools
- * Returns null if no specific message is defined (no loading message will be sent)
- */
-function getLoadingMessage(toolNames: string[]): string | null {
-  // Try to find a specific message for the first tool
-  for (const toolName of toolNames) {
-    const messages = TOOL_LOADING_MESSAGES[toolName];
-    if (messages && messages.length > 0) {
-      return messages[Math.floor(Math.random() * messages.length)];
-    }
-  }
-  // No message defined for these tools - don't send a loading message
-  return null;
+function getLoadingMessage(_toolNames: string[]): string | null {
+  return LOADING_MESSAGES[Math.floor(Math.random() * LOADING_MESSAGES.length)];
 }
 
 type DebouncedResponsePayload = {

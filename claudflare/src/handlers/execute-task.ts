@@ -280,12 +280,34 @@ export async function handleExecuteTask(
     await setupMainRepo(sandbox, GITHUB_TOKEN, repo);
     const worktreePath = await createWorktree(sandbox, requestId);
 
-    // Create ~/workspace symlink pointing to this worktree for convenience
     const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
+
+    // Create ~/workspace symlink pointing to this worktree for convenience
     await runCmd(
       sandbox,
       run(`ln -sfn ${worktreePath} /home/claudeuser/workspace`),
       "symlink-workspace",
+    );
+
+    // Write .claude/settings.json with agentcash MCP
+    const claudeSettingsJson = JSON.stringify({
+      mcpServers: {
+        agentcash: {
+          command: "bun",
+          args: ["x", "agentcash@latest", "server", "--provider", "whiskers"],
+        },
+      },
+    });
+    const settingsB64 = btoa(claudeSettingsJson);
+    await runCmd(
+      sandbox,
+      run(`mkdir -p ${worktreePath}/.claude`),
+      "mkdir-claude-settings",
+    );
+    await runCmd(
+      sandbox,
+      run(`bash -c 'echo "${settingsB64}" | base64 -d > ${worktreePath}/.claude/settings.json'`),
+      "write-claude-settings",
     );
 
     const systemPrompt = escapeShell(WORKSPACE_SYSTEM(username));
