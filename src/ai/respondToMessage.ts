@@ -182,14 +182,6 @@ function parseActions(text: string): MessageAction[] {
   }
 }
 
-async function getWorkspaceForConversation(context: ConversationContext): Promise<string> {
-  if (context.userContext?.professional) {
-    const prof = context.userContext.professional as Record<string, Record<string, string>>;
-    if (prof.github?.username) return prof.github.username;
-  }
-  return "default";
-}
-
 export async function respondToMessage(
   agent: Agent,
   messages: ModelMessage[],
@@ -212,10 +204,9 @@ export async function respondToMessage(
   }
 
   const prompt = buildClaudePrompt(agent, messages, context);
-  const workspaceUsername = await getWorkspaceForConversation(context);
   const requestId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  log.info("Sending to claudflare", { requestId, workspaceUsername });
+  log.info("Sending to claudflare", { requestId });
 
   if (options?.onToolsInvoked) {
     options.onToolsInvoked(["claudflare"]).catch((err) => {
@@ -230,10 +221,7 @@ export async function respondToMessage(
       Authorization: `Bearer ${claudflareSecret}`,
       "X-Request-ID": requestId,
     },
-    body: JSON.stringify({
-      task: prompt,
-      repo: `MeritSpace/${workspaceUsername}`,
-    }),
+    body: JSON.stringify({ task: prompt }),
     signal: options?.abortController?.signal,
   });
 
