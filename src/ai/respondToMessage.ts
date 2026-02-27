@@ -2,103 +2,109 @@ import type { Agent } from "@/src/ai/agents/types";
 import type { ConversationContext } from "@/src/db/conversation";
 import logger from "@/src/lib/logger";
 import type { MessageAction } from "@/src/lib/loopmessage-sdk/message-actions";
-import type { ModelMessage } from "ai";
+import type {
+  GroupParticipantInfo,
+  SystemState,
+  UserResearchContext,
+} from "@/src/types/conversation";
 
 export type { MessageAction } from "@/src/lib/loopmessage-sdk/message-actions";
 
+type ModelMessage = {
+  role: string;
+  content: string | unknown[];
+};
+
 export interface RespondToMessageOptions {
-  onToolsInvoked?: (toolNames: string[]) => Promise<void>;
   abortController?: AbortController;
   checkShouldAbort?: () => Promise<boolean>;
 }
 
+function buildConversationContextPrompt(context: {
+  conversationId: string;
+  isGroup: boolean;
+  summary?: string;
+  userContext?: UserResearchContext | null;
+  systemState?: SystemState | null;
+  groupParticipants?: GroupParticipantInfo[] | null;
+  sender?: string;
+  groupChatCustomPrompt?: string | null;
+}): string {
+  const parts: string[] = [];
+
+  if (context.systemState?.currentTime) {
+    const { formatted, timezone, dayOfWeek } = context.systemState.currentTime;
+    parts.push(`CURRENT TIME: ${formatted} (${timezone})`);
+    parts.push(`Today is ${dayOfWeek}`);
+    parts.push("");
+  }
+
+  parts.push(`CONVERSATION ID: ${context.conversationId}`);
+  parts.push("");
+
+  if (context.isGroup) {
+    parts.push("CONVERSATION TYPE: GROUP CHAT");
+    if (context.groupChatCustomPrompt) {
+      parts.push(`GROUP BEHAVIOR: ${context.groupChatCustomPrompt}`);
+    }
+    if (context.groupParticipants && context.groupParticipants.length > 0) {
+      parts.push("PARTICIPANTS:");
+      for (const p of context.groupParticipants) {
+        const name = p.name || "Unknown";
+        const brief = p.brief ? ` - ${p.brief}` : "";
+        parts.push(`• ${p.phoneNumber}: ${name}${brief}`);
+      }
+    }
+    if (context.sender) {
+      const senderInfo = context.groupParticipants?.find(p => p.phoneNumber === context.sender);
+      parts.push(`CURRENT SENDER: ${senderInfo?.name || "Unknown"} (${context.sender})`);
+    }
+  } else {
+    parts.push("CONVERSATION TYPE: DIRECT MESSAGE (1-on-1)");
+  }
+
+  if (context.summary) {
+    parts.push(`\nSUMMARY: ${context.summary}`);
+  }
+
+  if (context.userContext?.summary) {
+    parts.push(`\nUSER CONTEXT: ${context.userContext.summary}`);
+  }
+
+  if (context.systemState) {
+    const connected: string[] = [];
+    if (context.systemState.connections?.gmail) connected.push("Gmail");
+    if (context.systemState.connections?.github) connected.push("GitHub");
+    if (context.systemState.connections?.calendar) connected.push("Calendar");
+    if (connected.length > 0) {
+      parts.push(`Connected: ${connected.join(", ")}`);
+    }
+  }
+
+  return parts.join("\n");
+}
+
 function buildClaudePrompt(
-  agent: Agent,
+  _agent: Agent,
   messages: ModelMessage[],
   context: ConversationContext,
 ): string {
   const parts: string[] = [];
 
-  parts.push("You are responding to an iMessage conversation.");
+  const contextString = buildConversationContextPrompt({
+    conversationId: context.conversationId,
+    isGroup: context.isGroup,
+    summary: context.summary,
+    userContext: context.userContext,
+    systemState: context.systemState,
+    groupParticipants: context.groupParticipants,
+    sender: context.sender,
+    groupChatCustomPrompt: context.groupChatCustomPrompt,
+  });
+
+  parts.push("=== CONTEXT ===");
+  parts.push(contextString);
   parts.push("");
-  parts.push("=== PERSONALITY ===");
-  parts.push(agent.personality.prompt);
-  parts.push("");
-  parts.push("=== CONVERSATION INFO ===");
-  parts.push(`Conversation ID: ${context.conversationId}`);
-  parts.push(`Type: ${context.isGroup ? "GROUP CHAT" : "DIRECT MESSAGE"}`);
-
-  if (context.isGroup && context.sender) {
-    parts.push(`Current sender: ${context.sender}`);
-  }
-
-  if (context.summary) {
-    parts.push(`Summary: ${context.summary}`);
-  }
-
-  if (context.systemState?.currentTime) {
-    const { formatted, timezone } = context.systemState.currentTime;
-    parts.push(`Current time: ${formatted} (${timezone})`);
-  }
-
-  if (context.groupParticipants && context.groupParticipants.length > 0) {
-    parts.push("");
-    parts.push("Group participants:");
-    for (const p of context.groupParticipants) {
-      const name = p.name || "Unknown";
-      const brief = p.brief ? ` - ${p.brief}` : "";
-      parts.push(`  ${p.phoneNumber}: ${name}${brief}`);
-    }
-  }
-
-  if (context.userContext) {
-    parts.push("");
-    parts.push("User context:");
-    if (context.userContext.summary) parts.push(`  ${context.userContext.summary}`);
-    if (context.userContext.interests?.length) {
-      parts.push(`  Interests: ${context.userContext.interests.join(", ")}`);
-    }
-  }
-
-  if (context.systemState) {
-    const connected: string[] = [];
-    if (context.systemState.connections.gmail) connected.push("Gmail");
-    if (context.systemState.connections.github) connected.push("GitHub");
-    if (context.systemState.connections.calendar) connected.push("Calendar");
-    if (connected.length > 0) {
-      parts.push(`Connected accounts: ${connected.join(", ")}`);
-    }
-  }
-
-  parts.push("");
-  parts.push("=== OUTPUT FORMAT ===");
-  parts.push("You MUST output ONLY a valid JSON array of MessageAction objects. No markdown, no explanation, just the JSON array.");
-  parts.push("Each action: { type: \"message\"|\"reaction\", text?, attachments?, effect?, delay?, message_id?, reaction? }");
-  parts.push("Effects: slam, loud, gentle, invisible-ink, confetti, fireworks, lasers, love, balloons, spotlight, echo");
-  parts.push("Reactions: love, like, dislike, laugh, exclaim, question (prefix with - to remove)");
-  parts.push("Return [] if no response needed (especially in group chats).");
-  parts.push("");
-  parts.push("=== IMESSAGE RULES ===");
-  parts.push("Message IDs: User messages include [msg_id: ABC123]. Extract message_id from brackets for reactions.");
-  parts.push("");
-  if (context.isGroup) {
-    parts.push("GROUP CHAT: Respond in 1 message max (2 if absolutely necessary). Often a reaction is better. You do NOT need to respond to everything.");
-  } else {
-    parts.push("DM: Use multiple messages for fragmented thoughts (max 3-4). Add delays (500-8000ms) between messages.");
-  }
-  parts.push("");
-  parts.push("Reactions: Incoming reactions appear as [REACTION: {type} on msg_id: {id}]. Usually return [] for incoming reactions.");
-  parts.push("System messages: [SYSTEM: Deliver this message from X] MUST be delivered - you are a delivery service.");
-  parts.push("");
-
-  if (context.recentAttachments && context.recentAttachments.length > 0) {
-    parts.push("=== RECENT IMAGES ===");
-    context.recentAttachments.slice(0, 3).forEach((url, i) => {
-      parts.push(`Image ${i}: ${url}`);
-    });
-    parts.push("");
-  }
-
   parts.push("=== CONVERSATION HISTORY ===");
   for (const msg of messages) {
     const role = msg.role === "user" ? "USER" : "ASSISTANT";
@@ -111,6 +117,15 @@ function buildClaudePrompt(
   return parts.join("\n");
 }
 
+/**
+ * Consume Claude Code stream-json output.
+ *
+ * The format is newline-delimited JSON objects. Each has a `type` field.
+ * Assistant messages have: { type: "assistant", message: { role: "assistant", content: [...] } }
+ * The final result has: { type: "result", result: "..." } or the last assistant text block.
+ *
+ * We want the last assistant message's text content — that's where the JSON actions are.
+ */
 async function consumeClaudeStream(response: Response): Promise<string> {
   if (!response.ok) {
     const errorText = await response.text();
@@ -122,7 +137,7 @@ async function consumeClaudeStream(response: Response): Promise<string> {
 
   const decoder = new TextDecoder();
   let buffer = "";
-  let lastResultText = "";
+  let lastAssistantText = "";
 
   while (true) {
     const { done, value } = await reader.read();
@@ -136,10 +151,17 @@ async function consumeClaudeStream(response: Response): Promise<string> {
       if (!line.trim()) continue;
       try {
         const event = JSON.parse(line);
-        if (event.type === "result" && event.result) {
-          lastResultText = event.result;
-        } else if (event.type === "content" && event.content) {
-          lastResultText = event.content;
+
+        if (event.type === "assistant" && event.message?.content) {
+          for (const block of event.message.content) {
+            if (block.type === "text" && block.text) {
+              lastAssistantText = block.text;
+            }
+          }
+        }
+
+        if (event.type === "result" && typeof event.result === "string") {
+          lastAssistantText = event.result;
         }
       } catch {
         // not JSON, skip
@@ -150,17 +172,22 @@ async function consumeClaudeStream(response: Response): Promise<string> {
   if (buffer.trim()) {
     try {
       const event = JSON.parse(buffer);
-      if (event.type === "result" && event.result) {
-        lastResultText = event.result;
-      } else if (event.type === "content" && event.content) {
-        lastResultText = event.content;
+      if (event.type === "assistant" && event.message?.content) {
+        for (const block of event.message.content) {
+          if (block.type === "text" && block.text) {
+            lastAssistantText = block.text;
+          }
+        }
+      }
+      if (event.type === "result" && typeof event.result === "string") {
+        lastAssistantText = event.result;
       }
     } catch {
-      if (!lastResultText) lastResultText = buffer;
+      if (!lastAssistantText) lastAssistantText = buffer;
     }
   }
 
-  return lastResultText;
+  return lastAssistantText;
 }
 
 function parseActions(text: string): MessageAction[] {
@@ -208,12 +235,6 @@ export async function respondToMessage(
 
   log.info("Sending to claudflare", { requestId });
 
-  if (options?.onToolsInvoked) {
-    options.onToolsInvoked(["claudflare"]).catch((err) => {
-      log.error("Error in onToolsInvoked callback", { error: err });
-    });
-  }
-
   const response = await fetch(`${claudflareUrl}/execute`, {
     method: "POST",
     headers: {
@@ -226,13 +247,19 @@ export async function respondToMessage(
   });
 
   const finalText = await consumeClaudeStream(response);
-  const actions = parseActions(finalText);
-
   const after = performance.now();
-  log.info("Claudflare response", {
+
+  log.info("Claudflare response received", {
+    requestId,
     timeMs: Math.round(after - before),
-    actionCount: actions.length,
+    responseLength: finalText.length,
+    preview: finalText.slice(0, 200),
   });
 
-  return actions;
+  if (!finalText) {
+    log.warn("Empty response from claudflare");
+    return [];
+  }
+
+  return parseActions(finalText);
 }
