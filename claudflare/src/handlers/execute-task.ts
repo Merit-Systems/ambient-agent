@@ -293,8 +293,8 @@ export async function handleExecuteTask(
     const claudeSettingsJson = JSON.stringify({
       mcpServers: {
         agentcash: {
-          command: "bun",
-          args: ["x", "agentcash@latest", "server", "--provider", "whiskers"],
+          command: "npx",
+          args: ["-y", "agentcash@latest", "server", "--provider", "whiskers"],
         },
       },
     });
