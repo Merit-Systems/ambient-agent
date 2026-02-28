@@ -62,7 +62,7 @@ export async function deliverMessage(
     );
 
     // Step 2: Get conversation history and context
-    const { messages, context } = await getConversationMessages(conversationId);
+    const { messages, context } = await getConversationMessages(conversationId, 20);
 
     console.log(
       `[Delivery] Loaded ${messages.length} messages for context in ${conversationId}`,

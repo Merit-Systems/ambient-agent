@@ -53,7 +53,7 @@ export const debouncedResponse = task({
 
     const { messages, context } = await getConversationMessages(
       payload.conversationId,
-      100,
+      20,
     );
 
     if (messages.length === 0) {

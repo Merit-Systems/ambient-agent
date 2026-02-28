@@ -110,9 +110,10 @@ async function consumeAndCleanup(
 
       console.log("[consumeAndCleanup] Removing worktree...");
       await runCmd(sandbox, run(`git -C ${REPO_BASE} worktree remove --force ${workDir}`), "worktree-remove");
-    } else {
-      await runCmd(sandbox, `rm -rf ${workDir}`, "cleanup-scratch");
     }
+    // NOTE: For stateful sessions (no repo), we do NOT clean up the scratch dir.
+    // The sandbox persists across requests for the same sessionId, so Claude Code
+    // can maintain session state.
 
     console.log("[consumeAndCleanup] Done");
   } catch (error) {
@@ -166,9 +167,9 @@ async function createWorktree(sandbox: SandboxType, requestId: string): Promise<
   return worktreePath;
 }
 
-async function createScratchDir(sandbox: SandboxType, requestId: string): Promise<string> {
+async function ensureScratchDir(sandbox: SandboxType, sessionId: string): Promise<string> {
   const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
-  const scratchPath = `${SCRATCH_BASE}/${requestId}`;
+  const scratchPath = `${SCRATCH_BASE}/${sessionId}`;
   await runCmd(sandbox, run(`mkdir -p ${scratchPath}`), "mkdir-scratch");
   return scratchPath;
 }
@@ -192,6 +193,26 @@ async function writeMcpSettings(sandbox: SandboxType, workDir: string) {
   );
 }
 
+/**
+ * Write task to a temp file and pass via stdin to avoid shell escaping issues.
+ * Returns the path to the temp file.
+ */
+async function writeTaskFile(
+  sandbox: SandboxType,
+  workDir: string,
+  task: string,
+): Promise<string> {
+  const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
+  const taskPath = `${workDir}/.claude-task.txt`;
+  const b64 = btoa(unescape(encodeURIComponent(task)));
+  await runCmd(
+    sandbox,
+    run(`bash -c 'echo "${b64}" | base64 -d > ${taskPath}'`),
+    "write-task",
+  );
+  return taskPath;
+}
+
 export async function handleExecuteTask(
   request: Request,
   env: Env,
@@ -210,8 +231,9 @@ export async function handleExecuteTask(
     const body = (await request.json()) as {
       task?: string;
       repo?: string;
+      sessionId?: string;
     };
-    const { task, repo } = body;
+    const { task, repo, sessionId } = body;
     if (!task) return new Response("task required", { status: 400 });
 
     const hasRepo = !!repo;
@@ -227,7 +249,10 @@ export async function handleExecuteTask(
       return new Response("X-Request-ID header required", { status: 400 });
     }
 
-    const sandbox = getSandbox(env.Sandbox, requestId);
+    // Use sessionId as the sandbox key when provided (stateful conversations).
+    // Otherwise fall back to requestId (one-shot requests).
+    const sandboxKey = sessionId || requestId;
+    const sandbox = getSandbox(env.Sandbox, sandboxKey);
 
     await sandbox.setEnvVars({
       ANTHROPIC_API_KEY,
@@ -245,7 +270,8 @@ export async function handleExecuteTask(
       workDir = await createWorktree(sandbox, requestId);
       systemPrompt = WORKSPACE_SYSTEM(username!);
     } else {
-      workDir = await createScratchDir(sandbox, requestId);
+      // For stateful sessions, use sessionId so the scratch dir persists
+      workDir = await ensureScratchDir(sandbox, sandboxKey);
       systemPrompt = BRAIN_SYSTEM;
     }
 
@@ -254,21 +280,38 @@ export async function handleExecuteTask(
     await runCmd(sandbox, run(`ln -sfn ${workDir} /home/claudeuser/workspace`), "symlink-workspace");
     await writeMcpSettings(sandbox, workDir);
 
+    // Write task to file to avoid shell escaping issues with large prompts
+    const taskPath = await writeTaskFile(sandbox, workDir, task);
+
     const escapedSystem = escapeShell(systemPrompt);
-    const escapedTask = escapeShell(task);
-    const claudeCommand = [
+
+    // Build claude command — read prompt from file via stdin
+    const claudeArgs = [
       `cd ${workDir}`,
       "&&",
+      `cat ${taskPath}`,
+      "|",
       "runuser -u claudeuser -- env HOME=/home/claudeuser",
       `ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"`,
       "claude",
       `--append-system-prompt "${escapedSystem}"`,
       "--model opus",
-      `-p "${escapedTask}"`,
+      "-p -", // read prompt from stdin
       "--dangerously-skip-permissions",
       "--output-format stream-json",
       "--verbose",
-    ].join(" ");
+    ];
+
+    // Add session-id for stateful conversations
+    if (sessionId) {
+      claudeArgs.splice(
+        claudeArgs.indexOf("--verbose"),
+        0,
+        `--session-id "${escapeShell(sessionId)}"`,
+      );
+    }
+
+    const claudeCommand = claudeArgs.join(" ");
 
     const stream = await sandbox.execStream(claudeCommand);
     const [backgroundStream, responseStream] = stream.tee();
