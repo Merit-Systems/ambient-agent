@@ -20,7 +20,11 @@ export interface RespondToMessageOptions {
   checkShouldAbort?: () => Promise<boolean>;
 }
 
-function buildConversationContextPrompt(context: {
+/**
+ * Build a short context block (time, conversation type, participants).
+ * This is passed as metadata alongside the new message — NOT the full history.
+ */
+function buildContextBlock(context: {
   conversationId: string;
   isGroup: boolean;
   summary?: string;
@@ -56,8 +60,12 @@ function buildConversationContextPrompt(context: {
       }
     }
     if (context.sender) {
-      const senderInfo = context.groupParticipants?.find(p => p.phoneNumber === context.sender);
-      parts.push(`CURRENT SENDER: ${senderInfo?.name || "Unknown"} (${context.sender})`);
+      const senderInfo = context.groupParticipants?.find(
+        (p) => p.phoneNumber === context.sender,
+      );
+      parts.push(
+        `CURRENT SENDER: ${senderInfo?.name || "Unknown"} (${context.sender})`,
+      );
     }
   } else {
     parts.push("CONVERSATION TYPE: DIRECT MESSAGE (1-on-1)");
@@ -84,47 +92,32 @@ function buildConversationContextPrompt(context: {
   return parts.join("\n");
 }
 
-function buildClaudePrompt(
-  _agent: Agent,
-  messages: ModelMessage[],
-  context: ConversationContext,
-): string {
-  const parts: string[] = [];
+/**
+ * Extract only the new user messages since the last assistant response.
+ * Claude Code sessions are stateful — we only need to send what's new.
+ */
+function getNewUserMessages(messages: ModelMessage[]): string {
+  const newMessages: string[] = [];
 
-  const contextString = buildConversationContextPrompt({
-    conversationId: context.conversationId,
-    isGroup: context.isGroup,
-    summary: context.summary,
-    userContext: context.userContext,
-    systemState: context.systemState,
-    groupParticipants: context.groupParticipants,
-    sender: context.sender,
-    groupChatCustomPrompt: context.groupChatCustomPrompt,
-  });
-
-  parts.push("=== CONTEXT ===");
-  parts.push(contextString);
-  parts.push("");
-  parts.push("=== CONVERSATION HISTORY ===");
-  for (const msg of messages) {
-    const role = msg.role === "user" ? "USER" : "ASSISTANT";
-    const content = typeof msg.content === "string"
-      ? msg.content
-      : JSON.stringify(msg.content);
-    parts.push(`[${role}] ${content}`);
+  // Walk backwards to find messages since last assistant response
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg.role === "assistant") break;
+    newMessages.unshift(
+      typeof msg.content === "string"
+        ? msg.content
+        : JSON.stringify(msg.content),
+    );
   }
 
-  return parts.join("\n");
+  return newMessages.join("\n\n");
 }
 
 /**
  * Consume Claude Code stream-json output.
  *
- * The format is newline-delimited JSON objects. Each has a `type` field.
- * Assistant messages have: { type: "assistant", message: { role: "assistant", content: [...] } }
- * The final result has: { type: "result", result: "..." } or the last assistant text block.
- *
- * We want the last assistant message's text content — that's where the JSON actions are.
+ * Returns the `result` string from the final result event.
+ * Falls back to the last assistant text block if no result event.
  */
 async function consumeClaudeStream(response: Response): Promise<string> {
   if (!response.ok) {
@@ -137,6 +130,7 @@ async function consumeClaudeStream(response: Response): Promise<string> {
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let resultText = "";
   let lastAssistantText = "";
 
   while (true) {
@@ -161,7 +155,7 @@ async function consumeClaudeStream(response: Response): Promise<string> {
         }
 
         if (event.type === "result" && typeof event.result === "string") {
-          lastAssistantText = event.result;
+          resultText = event.result;
         }
       } catch {
         // not JSON, skip
@@ -169,6 +163,7 @@ async function consumeClaudeStream(response: Response): Promise<string> {
     }
   }
 
+  // Handle any remaining buffer
   if (buffer.trim()) {
     try {
       const event = JSON.parse(buffer);
@@ -180,22 +175,41 @@ async function consumeClaudeStream(response: Response): Promise<string> {
         }
       }
       if (event.type === "result" && typeof event.result === "string") {
-        lastAssistantText = event.result;
+        resultText = event.result;
       }
     } catch {
-      if (!lastAssistantText) lastAssistantText = buffer;
+      // ignore
     }
   }
 
-  return lastAssistantText;
+  // Prefer the result event, fall back to last assistant text
+  return resultText || lastAssistantText;
 }
 
+/**
+ * Parse the Claude response into MessageAction[].
+ *
+ * Tries JSON.parse directly first (ideal case — Claude returns clean JSON).
+ * Falls back to regex extraction if there's surrounding text.
+ */
 function parseActions(text: string): MessageAction[] {
   const trimmed = text.trim();
+  if (!trimmed) return [];
 
+  // Try direct parse first (cleanest path)
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (Array.isArray(parsed)) return parsed as MessageAction[];
+  } catch {
+    // not clean JSON, try extraction
+  }
+
+  // Fall back: extract JSON array from surrounding text
   const jsonMatch = trimmed.match(/\[[\s\S]*\]/);
   if (!jsonMatch) {
-    logger.warn("Could not find JSON array in claudflare response", { text: trimmed.slice(0, 500) });
+    logger.warn("Could not find JSON array in claudflare response", {
+      text: trimmed.slice(0, 500),
+    });
     return [];
   }
 
@@ -204,13 +218,16 @@ function parseActions(text: string): MessageAction[] {
     if (!Array.isArray(parsed)) return [];
     return parsed as MessageAction[];
   } catch (err) {
-    logger.error("Failed to parse actions from claudflare response", { error: err, text: trimmed.slice(0, 500) });
+    logger.error("Failed to parse actions from claudflare response", {
+      error: err,
+      text: trimmed.slice(0, 500),
+    });
     return [];
   }
 }
 
 export async function respondToMessage(
-  agent: Agent,
+  _agent: Agent,
   messages: ModelMessage[],
   context: ConversationContext,
   options?: RespondToMessageOptions,
@@ -230,10 +247,29 @@ export async function respondToMessage(
     throw new Error("CLAUDFLARE_URL and CLAUDFLARE_API_KEY must be set");
   }
 
-  const prompt = buildClaudePrompt(agent, messages, context);
+  // Build the prompt: context metadata + only new user messages
+  const contextBlock = buildContextBlock({
+    conversationId: context.conversationId,
+    isGroup: context.isGroup,
+    summary: context.summary,
+    userContext: context.userContext,
+    systemState: context.systemState,
+    groupParticipants: context.groupParticipants,
+    sender: context.sender,
+    groupChatCustomPrompt: context.groupChatCustomPrompt,
+  });
+
+  const newMessages = getNewUserMessages(messages);
+  const prompt = `${contextBlock}\n\n${newMessages}`;
+
   const requestId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  log.info("Sending to claudflare", { requestId });
+  log.info("Sending to claudflare", {
+    requestId,
+    conversationId: context.conversationId,
+    promptLength: prompt.length,
+    newMessageLength: newMessages.length,
+  });
 
   const response = await fetch(`${claudflareUrl}/execute`, {
     method: "POST",
@@ -242,7 +278,10 @@ export async function respondToMessage(
       Authorization: `Bearer ${claudflareSecret}`,
       "X-Request-ID": requestId,
     },
-    body: JSON.stringify({ task: prompt }),
+    body: JSON.stringify({
+      task: prompt,
+      sessionId: context.conversationId,
+    }),
     signal: options?.abortController?.signal,
   });
 
