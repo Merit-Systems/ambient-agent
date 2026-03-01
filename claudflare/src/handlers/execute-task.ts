@@ -7,6 +7,7 @@ import { escapeShell } from "../utils/strings";
 const REPO_BASE = "/home/claudeuser/repo";
 const WORKTREES_BASE = "/home/claudeuser/worktrees";
 const SCRATCH_BASE = "/home/claudeuser/scratch";
+const AGENT_RUNNER = "/opt/agent-runner.mjs";
 
 const COMMIT_AGENT_PROMPT = `You are a commit agent. Your ONLY job is to commit and push any uncommitted changes.
 
@@ -19,107 +20,7 @@ const COMMIT_AGENT_PROMPT = `You are a commit agent. Your ONLY job is to commit 
 
 Do nothing else. Just commit and push, then stop.`;
 
-async function consumeAndCleanup(
-  stream: ReadableStream<Uint8Array>,
-  sandbox: SandboxType,
-  workDir: string,
-  requestId: string,
-  task: string,
-  anthropicKey: string,
-  hasRepo: boolean,
-): Promise<void> {
-  const reader = stream.getReader();
-  const events: string[] = [];
-  const decoder = new TextDecoder();
-  let buffer = "";
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() || "";
-
-      for (const line of lines) {
-        if (line.trim()) {
-          const redacted = line.replace(/sk-ant-[a-zA-Z0-9_-]+/g, "[REDACTED]");
-          events.push(redacted);
-        }
-      }
-    }
-
-    if (buffer.trim()) {
-      const redacted = buffer.replace(/sk-ant-[a-zA-Z0-9_-]+/g, "[REDACTED]");
-      events.push(redacted);
-    }
-
-    console.log(`[consumeAndCleanup] Stream complete, ${events.length} events`);
-    const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
-
-    if (hasRepo) {
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const logDir = `${REPO_BASE}/.logs`;
-      const logPath = `${logDir}/${requestId}-${timestamp}.jsonl`;
-
-      const logLines = [
-        JSON.stringify({ type: "metadata", task, requestId, timestamp }),
-        ...events,
-      ].join("\n");
-      const b64 = btoa(unescape(encodeURIComponent(logLines)));
-
-      await runCmd(sandbox, run(`mkdir -p ${logDir}`), "mkdir-logs");
-      await runCmd(
-        sandbox,
-        run(`bash -c 'echo "${b64}" | base64 -d > ${logPath}'`),
-        "write-log",
-      );
-
-      console.log("[consumeAndCleanup] Running commit agent...");
-      const commitPrompt = escapeShell(COMMIT_AGENT_PROMPT);
-      const commitCmd = [
-        `cd ${workDir}`,
-        "&&",
-        "runuser -u claudeuser -- env HOME=/home/claudeuser",
-        `ANTHROPIC_API_KEY="${anthropicKey}"`,
-        "claude",
-        `-p "${commitPrompt}"`,
-        "--dangerously-skip-permissions",
-        "--max-turns 5",
-      ].join(" ");
-
-      const commitAgentResult = await runCmd(sandbox, commitCmd, "commit-agent");
-      console.log(
-        "[consumeAndCleanup] Commit agent done:",
-        commitAgentResult.success ? "success" : "failed",
-      );
-
-      console.log("[consumeAndCleanup] Committing logs...");
-      await runCmd(sandbox, run(`git -C ${REPO_BASE} add .logs/`), "git-add-logs");
-      const logsStaged = await runCmd(
-        sandbox,
-        run(`git -C ${REPO_BASE} diff --cached --quiet; echo $?`),
-        "git-check-staged",
-      );
-      if (logsStaged.stdout.trim() !== "0") {
-        await runCmd(sandbox, run(`git -C ${REPO_BASE} commit -m "logs: ${requestId}"`), "git-commit-logs");
-        await runCmd(sandbox, run(`git -C ${REPO_BASE} pull --rebase origin HEAD || true`), "git-pull-logs");
-        await runCmd(sandbox, run(`git -C ${REPO_BASE} push origin HEAD`), "git-push-logs");
-      }
-
-      console.log("[consumeAndCleanup] Removing worktree...");
-      await runCmd(sandbox, run(`git -C ${REPO_BASE} worktree remove --force ${workDir}`), "worktree-remove");
-    }
-    // NOTE: For stateful sessions (no repo), we do NOT clean up the scratch dir.
-    // The sandbox persists across requests for the same sessionId, so Claude Code
-    // can maintain session state.
-
-    console.log("[consumeAndCleanup] Done");
-  } catch (error) {
-    console.error("[consumeAndCleanup] Error:", error);
-  }
-}
+// ── Shared helpers ──────────────────────────────────────────────────────
 
 async function ensureUser(sandbox: SandboxType) {
   const check = await runCmd(sandbox, "id claudeuser", "user-check");
@@ -128,15 +29,52 @@ async function ensureUser(sandbox: SandboxType) {
   }
 }
 
+async function writeTaskFile(
+  sandbox: SandboxType,
+  dir: string,
+  task: string,
+): Promise<string> {
+  const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
+  const taskPath = `${dir}/.claude-task.txt`;
+  const b64 = btoa(unescape(encodeURIComponent(task)));
+  await runCmd(
+    sandbox,
+    run(`bash -c 'echo "${b64}" | base64 -d > ${taskPath}'`),
+    "write-task",
+  );
+  return taskPath;
+}
+
+async function writeSystemPrompt(
+  sandbox: SandboxType,
+  dir: string,
+  systemPrompt: string,
+): Promise<void> {
+  const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
+  const b64 = btoa(unescape(encodeURIComponent(systemPrompt)));
+  await runCmd(
+    sandbox,
+    run(`bash -c 'echo "${b64}" | base64 -d > ${dir}/.system-prompt.txt'`),
+    "write-system-prompt",
+  );
+}
+
+async function ensureScratchDir(sandbox: SandboxType, id: string): Promise<string> {
+  const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
+  const scratchPath = `${SCRATCH_BASE}/${id}`;
+  await runCmd(sandbox, run(`mkdir -p ${scratchPath}`), "mkdir-scratch");
+  return scratchPath;
+}
+
+// ── Workspace (repo) helpers ────────────────────────────────────────────
+
 async function setupMainRepo(sandbox: SandboxType, token: string, repo: string) {
   const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
-
   const check = await runCmd(
     sandbox,
     `test -d ${REPO_BASE}/.git && echo exists || echo missing`,
     "repo-check",
   );
-
   if (check.stdout.trim() === "missing") {
     const clone = await runCmd(
       sandbox,
@@ -147,7 +85,6 @@ async function setupMainRepo(sandbox: SandboxType, token: string, repo: string) 
   } else {
     await runCmd(sandbox, run(`git -C ${REPO_BASE} fetch --all`), "fetch");
   }
-
   await runCmd(sandbox, run(`git -C ${REPO_BASE} config user.email "merit-bot@merit.systems"`), "config-email");
   await runCmd(sandbox, run(`git -C ${REPO_BASE} config user.name "Merit Bot"`), "config-name");
   await runCmd(sandbox, run(`mkdir -p ${WORKTREES_BASE}`), "mkdir-worktrees");
@@ -157,21 +94,12 @@ async function createWorktree(sandbox: SandboxType, requestId: string): Promise<
   const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
   const worktreePath = `${WORKTREES_BASE}/${requestId}`;
   const localBranch = `worktree-${requestId}`;
-
   await runCmd(
     sandbox,
     run(`git -C ${REPO_BASE} worktree add -b ${localBranch} ${worktreePath} origin/master`),
     "worktree-add",
   );
-
   return worktreePath;
-}
-
-async function ensureScratchDir(sandbox: SandboxType, sessionId: string): Promise<string> {
-  const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
-  const scratchPath = `${SCRATCH_BASE}/${sessionId}`;
-  await runCmd(sandbox, run(`mkdir -p ${scratchPath}`), "mkdir-scratch");
-  return scratchPath;
 }
 
 async function writeMcpSettings(sandbox: SandboxType, workDir: string) {
@@ -193,25 +121,85 @@ async function writeMcpSettings(sandbox: SandboxType, workDir: string) {
   );
 }
 
-/**
- * Write task to a temp file and pass via stdin to avoid shell escaping issues.
- * Returns the path to the temp file.
- */
-async function writeTaskFile(
+// ── Background cleanup ──────────────────────────────────────────────────
+
+async function consumeAndCleanup(
+  stream: ReadableStream<Uint8Array>,
   sandbox: SandboxType,
   workDir: string,
+  requestId: string,
   task: string,
-): Promise<string> {
-  const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
-  const taskPath = `${workDir}/.claude-task.txt`;
-  const b64 = btoa(unescape(encodeURIComponent(task)));
-  await runCmd(
-    sandbox,
-    run(`bash -c 'echo "${b64}" | base64 -d > ${taskPath}'`),
-    "write-task",
-  );
-  return taskPath;
+  anthropicKey: string,
+  hasRepo: boolean,
+): Promise<void> {
+  const reader = stream.getReader();
+  const events: string[] = [];
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+      for (const line of lines) {
+        if (line.trim()) {
+          events.push(line.replace(/sk-ant-[a-zA-Z0-9_-]+/g, "[REDACTED]"));
+        }
+      }
+    }
+    if (buffer.trim()) {
+      events.push(buffer.replace(/sk-ant-[a-zA-Z0-9_-]+/g, "[REDACTED]"));
+    }
+
+    console.log(`[consumeAndCleanup] Stream complete, ${events.length} events`);
+
+    if (hasRepo) {
+      const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const logDir = `${REPO_BASE}/.logs`;
+      const logPath = `${logDir}/${requestId}-${timestamp}.jsonl`;
+      const logLines = [
+        JSON.stringify({ type: "metadata", task, requestId, timestamp }),
+        ...events,
+      ].join("\n");
+      const b64 = btoa(unescape(encodeURIComponent(logLines)));
+
+      await runCmd(sandbox, run(`mkdir -p ${logDir}`), "mkdir-logs");
+      await runCmd(sandbox, run(`bash -c 'echo "${b64}" | base64 -d > ${logPath}'`), "write-log");
+
+      const commitPrompt = escapeShell(COMMIT_AGENT_PROMPT);
+      const commitCmd = [
+        `cd ${workDir} &&`,
+        `runuser -u claudeuser -- env HOME=/home/claudeuser ANTHROPIC_API_KEY="${anthropicKey}"`,
+        `claude -p "${commitPrompt}" --dangerously-skip-permissions --max-turns 5`,
+      ].join(" ");
+      await runCmd(sandbox, commitCmd, "commit-agent");
+
+      await runCmd(sandbox, run(`git -C ${REPO_BASE} add .logs/`), "git-add-logs");
+      const logsStaged = await runCmd(
+        sandbox,
+        run(`git -C ${REPO_BASE} diff --cached --quiet; echo $?`),
+        "git-check-staged",
+      );
+      if (logsStaged.stdout.trim() !== "0") {
+        await runCmd(sandbox, run(`git -C ${REPO_BASE} commit -m "logs: ${requestId}"`), "git-commit-logs");
+        await runCmd(sandbox, run(`git -C ${REPO_BASE} pull --rebase origin HEAD || true`), "git-pull-logs");
+        await runCmd(sandbox, run(`git -C ${REPO_BASE} push origin HEAD`), "git-push-logs");
+      }
+      await runCmd(sandbox, run(`git -C ${REPO_BASE} worktree remove --force ${workDir}`), "worktree-remove");
+    }
+    // Brain mode: don't clean up scratch dir — session persists
+
+    console.log("[consumeAndCleanup] Done");
+  } catch (error) {
+    console.error("[consumeAndCleanup] Error:", error);
+  }
 }
+
+// ── Main handler ────────────────────────────────────────────────────────
 
 export async function handleExecuteTask(
   request: Request,
@@ -245,12 +233,10 @@ export async function handleExecuteTask(
       return new Response("GITHUB_TOKEN not set (required when repo is provided)", { status: 500 });
 
     const requestId = request.headers.get("X-Request-ID");
-    if (!requestId) {
+    if (!requestId)
       return new Response("X-Request-ID header required", { status: 400 });
-    }
 
-    // Use sessionId as the sandbox key when provided (stateful conversations).
-    // Otherwise fall back to requestId (one-shot requests).
+    // Sandbox key: sessionId for stateful brain, requestId for one-shot workspace
     const sandboxKey = sessionId || requestId;
     const sandbox = getSandbox(env.Sandbox, sandboxKey);
 
@@ -262,70 +248,64 @@ export async function handleExecuteTask(
     });
     await ensureUser(sandbox);
 
-    let workDir: string;
-    let systemPrompt: string;
-
     if (hasRepo) {
+      // ── Workspace mode: Claude CLI in a git worktree ────────────────
       await setupMainRepo(sandbox, GITHUB_TOKEN, repo!);
-      workDir = await createWorktree(sandbox, requestId);
-      systemPrompt = WORKSPACE_SYSTEM(username!);
+      const workDir = await createWorktree(sandbox, requestId);
+      const systemPrompt = WORKSPACE_SYSTEM(username!);
+
+      const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
+      await runCmd(sandbox, run(`ln -sfn ${workDir} /home/claudeuser/workspace`), "symlink-workspace");
+      await writeMcpSettings(sandbox, workDir);
+
+      const taskPath = await writeTaskFile(sandbox, workDir, task);
+      const escapedSystem = escapeShell(systemPrompt);
+      const claudeCommand = [
+        `cd ${workDir} &&`,
+        `runuser -u claudeuser -- env HOME=/home/claudeuser ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"`,
+        `claude --append-system-prompt "${escapedSystem}" --model opus`,
+        `-p "$(cat '${taskPath}')"`,
+        `--dangerously-skip-permissions --output-format stream-json --verbose`,
+      ].join(" ");
+
+      const stream = await sandbox.execStream(claudeCommand);
+      const [bgStream, resStream] = stream.tee();
+      ctx.waitUntil(consumeAndCleanup(bgStream, sandbox, workDir, requestId, task, ANTHROPIC_API_KEY, true));
+
+      return new Response(resStream, {
+        headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+      });
     } else {
-      // For stateful sessions, use sessionId so the scratch dir persists
-      workDir = await ensureScratchDir(sandbox, sandboxKey);
-      systemPrompt = BRAIN_SYSTEM;
+      // ── Brain mode: Agent SDK via agent-runner.mjs ──────────────────
+      const workDir = await ensureScratchDir(sandbox, sandboxKey);
+      const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
+
+      await runCmd(sandbox, run(`ln -sfn ${workDir} /home/claudeuser/workspace`), "symlink-workspace");
+
+      // Write task and system prompt to files (no shell escaping needed)
+      const taskPath = await writeTaskFile(sandbox, workDir, task);
+      await writeSystemPrompt(sandbox, workDir, BRAIN_SYSTEM);
+
+      // Run agent SDK inside the sandbox via the runner script
+      // The runner reads the task file, uses the system prompt env var,
+      // and streams NDJSON to stdout.
+      const agentCommand = [
+        `cd ${workDir} &&`,
+        `runuser -u claudeuser -- env HOME=/home/claudeuser`,
+        `ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"`,
+        `SYSTEM_PROMPT="$(cat '${workDir}/.system-prompt.txt')"`,
+        `node ${AGENT_RUNNER} '${taskPath}'`,
+        sessionId ? `'${sessionId.replace(/'/g, "'\\''")}'` : "",
+      ].filter(Boolean).join(" ");
+
+      const stream = await sandbox.execStream(agentCommand);
+      const [bgStream, resStream] = stream.tee();
+      ctx.waitUntil(consumeAndCleanup(bgStream, sandbox, workDir, requestId, task, ANTHROPIC_API_KEY, false));
+
+      return new Response(resStream, {
+        headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" },
+      });
     }
-
-    const run = (cmd: string) => `runuser -u claudeuser -- ${cmd}`;
-
-    await runCmd(sandbox, run(`ln -sfn ${workDir} /home/claudeuser/workspace`), "symlink-workspace");
-    await writeMcpSettings(sandbox, workDir);
-
-    // Write task to file to avoid shell escaping issues with large prompts
-    const taskPath = await writeTaskFile(sandbox, workDir, task);
-
-    const escapedSystem = escapeShell(systemPrompt);
-
-    // Build claude command — read prompt from file via stdin
-    const claudeArgs = [
-      `cd ${workDir}`,
-      "&&",
-      `cat ${taskPath}`,
-      "|",
-      "runuser -u claudeuser -- env HOME=/home/claudeuser",
-      `ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"`,
-      "claude",
-      `--append-system-prompt "${escapedSystem}"`,
-      "--model opus",
-      "-p -", // read prompt from stdin
-      "--dangerously-skip-permissions",
-      "--output-format stream-json",
-      "--verbose",
-    ];
-
-    // Add session-id for stateful conversations
-    if (sessionId) {
-      claudeArgs.splice(
-        claudeArgs.indexOf("--verbose"),
-        0,
-        `--session-id "${escapeShell(sessionId)}"`,
-      );
-    }
-
-    const claudeCommand = claudeArgs.join(" ");
-
-    const stream = await sandbox.execStream(claudeCommand);
-    const [backgroundStream, responseStream] = stream.tee();
-
-    ctx.waitUntil(
-      consumeAndCleanup(backgroundStream, sandbox, workDir, requestId, task, ANTHROPIC_API_KEY, hasRepo),
-    );
-
-    return new Response(responseStream, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-      },
-    });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     return new Response(`Error: ${msg}`, { status: 500 });
