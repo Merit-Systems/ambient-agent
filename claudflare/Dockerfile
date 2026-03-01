@@ -1,13 +1,16 @@
 FROM docker.io/cloudflare/sandbox:0.5.1
 
-RUN npm install -g @anthropic-ai/claude-code @anthropic-ai/claude-agent-sdk agentcash && \
+RUN npm install -g @anthropic-ai/claude-agent-sdk agentcash && \
     npm cache clean --force && \
     # Remove ripgrep binaries for platforms we don't need (only keep x64-linux)
     cd /usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk/vendor/ripgrep 2>/dev/null && \
     rm -rf arm64-darwin arm64-linux arm64-win32 x64-darwin x64-win32 || true && \
     # Remove wasm files not needed in sandbox
     rm -f /usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk/tree-sitter*.wasm 2>/dev/null || true && \
-    rm -f /usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk/resvg.wasm 2>/dev/null || true
+    rm -f /usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk/resvg.wasm 2>/dev/null || true && \
+    # Create `claude` wrapper using the SDK's bundled CLI (avoids the separate ~80MB claude-code package)
+    printf '#!/bin/sh\nexec node /usr/local/lib/node_modules/@anthropic-ai/claude-agent-sdk/cli.js "$@"\n' > /usr/local/bin/claude && \
+    chmod +x /usr/local/bin/claude
 ENV COMMAND_TIMEOUT_MS=300000
 EXPOSE 3000
 
