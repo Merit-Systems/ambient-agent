@@ -4,6 +4,24 @@ import { Env } from "../types";
 import { runCmd, SandboxType } from "../utils/sandbox";
 import { escapeShell } from "../utils/strings";
 
+/**
+ * Derive a deterministic UUID from an arbitrary string (like a phone number).
+ * Uses SHA-256 and formats as UUID v4 shape (with version/variant bits set).
+ */
+async function deriveUuid(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  const bytes = new Uint8Array(hash);
+  // Set version 4 bits
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  // Set variant bits
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes.slice(0, 16))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+}
+
 const REPO_BASE = "/home/claudeuser/repo";
 const WORKTREES_BASE = "/home/claudeuser/worktrees";
 const SCRATCH_BASE = "/home/claudeuser/scratch";
@@ -285,33 +303,31 @@ export async function handleExecuteTask(
 
     const escapedSystem = escapeShell(systemPrompt);
 
-    // Build claude command — read prompt from file via stdin
+    // Build claude command
+    // Use --resume to continue a stateful session, or --session-id to start one.
+    // Claude CLI requires --session-id to be a valid UUID, so we derive one
+    // deterministically from the conversationId.
     const claudeArgs = [
       `cd ${workDir}`,
       "&&",
-      `cat ${taskPath}`,
-      "|",
       "runuser -u claudeuser -- env HOME=/home/claudeuser",
       `ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY}"`,
       "claude",
       `--append-system-prompt "${escapedSystem}"`,
       "--model opus",
-      "-p -", // read prompt from stdin
       "--dangerously-skip-permissions",
       "--output-format stream-json",
       "--verbose",
     ];
 
-    // Add session-id for stateful conversations
     if (sessionId) {
-      claudeArgs.splice(
-        claudeArgs.indexOf("--verbose"),
-        0,
-        `--session-id "${escapeShell(sessionId)}"`,
-      );
+      const sessionUuid = await deriveUuid(sessionId);
+      // --resume continues an existing session; if none exists Claude creates one
+      claudeArgs.push(`--resume ${sessionUuid}`);
     }
 
-    const claudeCommand = claudeArgs.join(" ");
+    // Read prompt from file — avoids shell escaping issues entirely
+    const claudeCommand = claudeArgs.join(" ") + ` -p "$(cat '${taskPath}')"`;
 
     const stream = await sandbox.execStream(claudeCommand);
     const [backgroundStream, responseStream] = stream.tee();
