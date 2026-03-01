@@ -7,6 +7,7 @@ import type {
   SystemState,
   UserResearchContext,
 } from "@/src/types/conversation";
+import { query, type Options } from "@anthropic-ai/claude-agent-sdk";
 
 export type { MessageAction } from "@/src/lib/loopmessage-sdk/message-actions";
 
@@ -22,7 +23,6 @@ export interface RespondToMessageOptions {
 
 /**
  * Build a short context block (time, conversation type, participants).
- * This is passed as metadata alongside the new message — NOT the full history.
  */
 function buildContextBlock(context: {
   conversationId: string;
@@ -94,12 +94,11 @@ function buildContextBlock(context: {
 
 /**
  * Extract only the new user messages since the last assistant response.
- * Claude Code sessions are stateful — we only need to send what's new.
+ * Claude agent SDK sessions are stateful — we only need to send what's new.
  */
 function getNewUserMessages(messages: ModelMessage[]): string {
   const newMessages: string[] = [];
 
-  // Walk backwards to find messages since last assistant response
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg.role === "assistant") break;
@@ -114,100 +113,25 @@ function getNewUserMessages(messages: ModelMessage[]): string {
 }
 
 /**
- * Consume Claude Code stream-json output.
- *
- * Returns the `result` string from the final result event.
- * Falls back to the last assistant text block if no result event.
- */
-async function consumeClaudeStream(response: Response): Promise<string> {
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Claudflare error ${response.status}: ${errorText}`);
-  }
-
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error("No response body from claudflare");
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let resultText = "";
-  let lastAssistantText = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      try {
-        const event = JSON.parse(line);
-
-        if (event.type === "assistant" && event.message?.content) {
-          for (const block of event.message.content) {
-            if (block.type === "text" && block.text) {
-              lastAssistantText = block.text;
-            }
-          }
-        }
-
-        if (event.type === "result" && typeof event.result === "string") {
-          resultText = event.result;
-        }
-      } catch {
-        // not JSON, skip
-      }
-    }
-  }
-
-  // Handle any remaining buffer
-  if (buffer.trim()) {
-    try {
-      const event = JSON.parse(buffer);
-      if (event.type === "assistant" && event.message?.content) {
-        for (const block of event.message.content) {
-          if (block.type === "text" && block.text) {
-            lastAssistantText = block.text;
-          }
-        }
-      }
-      if (event.type === "result" && typeof event.result === "string") {
-        resultText = event.result;
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  // Prefer the result event, fall back to last assistant text
-  return resultText || lastAssistantText;
-}
-
-/**
  * Parse the Claude response into MessageAction[].
- *
- * Tries JSON.parse directly first (ideal case — Claude returns clean JSON).
- * Falls back to regex extraction if there's surrounding text.
+ * Tries JSON.parse directly first, then regex extraction.
  */
 function parseActions(text: string): MessageAction[] {
   const trimmed = text.trim();
   if (!trimmed) return [];
 
-  // Try direct parse first (cleanest path)
+  // Try direct parse (cleanest path)
   try {
     const parsed = JSON.parse(trimmed);
     if (Array.isArray(parsed)) return parsed as MessageAction[];
   } catch {
-    // not clean JSON, try extraction
+    // not clean JSON
   }
 
   // Fall back: extract JSON array from surrounding text
   const jsonMatch = trimmed.match(/\[[\s\S]*\]/);
   if (!jsonMatch) {
-    logger.warn("Could not find JSON array in claudflare response", {
+    logger.warn("Could not find JSON array in agent SDK response", {
       text: trimmed.slice(0, 500),
     });
     return [];
@@ -218,13 +142,19 @@ function parseActions(text: string): MessageAction[] {
     if (!Array.isArray(parsed)) return [];
     return parsed as MessageAction[];
   } catch (err) {
-    logger.error("Failed to parse actions from claudflare response", {
+    logger.error("Failed to parse actions from agent SDK response", {
       error: err,
       text: trimmed.slice(0, 500),
     });
     return [];
   }
 }
+
+/**
+ * Session store — maps conversationId to the session UUID from the agent SDK.
+ * This allows us to resume conversations across requests.
+ */
+const sessionStore = new Map<string, string>();
 
 export async function respondToMessage(
   _agent: Agent,
@@ -240,14 +170,12 @@ export async function respondToMessage(
     sender: context.sender,
   });
 
-  const claudflareUrl = process.env.CLAUDFLARE_URL;
-  const claudflareSecret = process.env.CLAUDFLARE_API_KEY;
-
-  if (!claudflareUrl || !claudflareSecret) {
-    throw new Error("CLAUDFLARE_URL and CLAUDFLARE_API_KEY must be set");
+  const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
+  if (!anthropicApiKey) {
+    throw new Error("ANTHROPIC_API_KEY must be set");
   }
 
-  // Build the prompt: context metadata + only new user messages
+  // Build prompt: context metadata + only new user messages
   const contextBlock = buildContextBlock({
     conversationId: context.conversationId,
     isGroup: context.isGroup,
@@ -262,43 +190,107 @@ export async function respondToMessage(
   const newMessages = getNewUserMessages(messages);
   const prompt = `${contextBlock}\n\n${newMessages}`;
 
-  const requestId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-  log.info("Sending to claudflare", {
-    requestId,
+  log.info("Sending to agent SDK", {
     conversationId: context.conversationId,
     promptLength: prompt.length,
-    newMessageLength: newMessages.length,
+    hasExistingSession: sessionStore.has(context.conversationId),
   });
 
-  const response = await fetch(`${claudflareUrl}/execute`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${claudflareSecret}`,
-      "X-Request-ID": requestId,
+  // Build agent SDK options
+  const existingSessionId = sessionStore.get(context.conversationId);
+
+  const sdkOptions: Options = {
+    model: "claude-sonnet-4-5-20250929",
+    permissionMode: "bypassPermissions",
+    systemPrompt: _agent.personality.prompt,
+    maxTurns: 3,
+    env: {
+      ...process.env as Record<string, string>,
+      ANTHROPIC_API_KEY: anthropicApiKey,
     },
-    body: JSON.stringify({
-      task: prompt,
-      sessionId: context.conversationId,
-    }),
-    signal: options?.abortController?.signal,
-  });
+    // Resume existing session if we have one
+    ...(existingSessionId && { resume: existingSessionId }),
+    // Disable built-in tools — Mr. Whiskers just generates JSON actions
+    tools: [],
+    // Configure agentcash MCP for x402 tool access
+    mcpServers: {
+      agentcash: {
+        command: "npx",
+        args: ["-y", "agentcash@latest", "server", "--provider", "whiskers"],
+      },
+    },
+  };
 
-  const finalText = await consumeClaudeStream(response);
-  const after = performance.now();
-
-  log.info("Claudflare response received", {
-    requestId,
-    timeMs: Math.round(after - before),
-    responseLength: finalText.length,
-    preview: finalText.slice(0, 200),
-  });
-
-  if (!finalText) {
-    log.warn("Empty response from claudflare");
-    return [];
+  if (options?.abortController) {
+    sdkOptions.abortController = options.abortController;
   }
 
-  return parseActions(finalText);
+  try {
+    let resultText = "";
+    let sessionId: string | undefined;
+
+    for await (const message of query({ prompt, options: sdkOptions })) {
+      // Check for abort between messages
+      if (options?.checkShouldAbort) {
+        const shouldAbort = await options.checkShouldAbort();
+        if (shouldAbort) {
+          options.abortController?.abort();
+          return [];
+        }
+      }
+
+      if (message.type === "result") {
+        if ("result" in message && typeof message.result === "string") {
+          resultText = message.result;
+        }
+        if ("session_id" in message && message.session_id) {
+          sessionId = message.session_id;
+        }
+      }
+
+      // Also capture assistant text as fallback
+      if (
+        message.type === "assistant" &&
+        "message" in message &&
+        message.message?.content
+      ) {
+        for (const block of message.message.content) {
+          if (
+            typeof block === "object" &&
+            block !== null &&
+            "type" in block &&
+            block.type === "text" &&
+            "text" in block &&
+            typeof block.text === "string"
+          ) {
+            resultText = block.text;
+          }
+        }
+      }
+    }
+
+    // Store session ID for future resumption
+    if (sessionId) {
+      sessionStore.set(context.conversationId, sessionId);
+      log.info("Session stored", { conversationId: context.conversationId, sessionId });
+    }
+
+    const after = performance.now();
+    log.info("Agent SDK response received", {
+      timeMs: Math.round(after - before),
+      responseLength: resultText.length,
+      preview: resultText.slice(0, 200),
+    });
+
+    if (!resultText) {
+      log.warn("Empty response from agent SDK");
+      return [];
+    }
+
+    return parseActions(resultText);
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    log.error("Agent SDK query failed", { error: errorMsg });
+    throw error;
+  }
 }

@@ -22,7 +22,7 @@ type DebouncedResponsePayload = {
 export const debouncedResponse = task({
   id: "debounced-response",
   machine: {
-    preset: "medium-1x",
+    preset: "medium-2x",
   },
   run: async (payload: DebouncedResponsePayload, { ctx }) => {
     const taskId = ctx.run.id;
